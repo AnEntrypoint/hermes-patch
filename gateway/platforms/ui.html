@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hermes</title>
+<script type="importmap">
+{"imports":{"webjsx":"https://cdn.jsdelivr.net/npm/webjsx@0.0.73/dist/index.js","webjsx/jsx-runtime":"https://cdn.jsdelivr.net/npm/webjsx@0.0.73/dist/jsx-runtime.js"}}
+</script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rippleui@1.12.1/dist/css/styles.css">
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+#log{height:calc(100vh - 140px);overflow-y:auto}
+.msg-user{justify-content:flex-end}
+.msg-assistant{justify-content:flex-start}
+.chat-bubble-secondary p{margin:0.25rem 0}
+.chat-bubble-secondary ul,.chat-bubble-secondary ol{margin:0.25rem 0;padding-left:1.25rem}
+.chat-bubble-secondary li{margin:0.1rem 0}
+.chat-bubble-secondary strong{font-weight:600}
+.chat-bubble-secondary h1,.chat-bubble-secondary h2,.chat-bubble-secondary h3{font-weight:700;margin:0.5rem 0 0.25rem}
+.chat-bubble-secondary code{background:rgba(0,0,0,0.15);padding:0.1rem 0.3rem;border-radius:3px;font-family:monospace;font-size:0.9em}
+.chat-bubble-secondary pre{background:rgba(0,0,0,0.15);padding:0.5rem;border-radius:4px;overflow-x:auto;margin:0.25rem 0}
+.chat-bubble-secondary pre code{background:none;padding:0}
+.chat-bubble-secondary blockquote{border-left:3px solid rgba(255,255,255,0.4);padding-left:0.75rem;margin:0.25rem 0;font-style:italic}
+</style>
+</head>
+<body class="bg-base-2 flex flex-col h-screen p-4 max-w-2xl mx-auto">
+<h1 class="text-xl font-bold mb-2">Hermes</h1>
+<div id="log" class="flex flex-col gap-2 mb-2"></div>
+<form id="frm" class="flex gap-2">
+<input id="inp" class="input input-bordered flex-1" placeholder="Message…" autocomplete="off">
+<button class="btn btn-primary" type="submit">Send</button>
+</form>
+<script type="module">
+import { createElement } from "webjsx";
+window.__debug = {};
+const log = document.getElementById("log");
+const inp = document.getElementById("inp");
+const frm = document.getElementById("frm");
+const msgs = [];
+const token = new URLSearchParams(location.search).get("token") || localStorage.getItem("token") || "";
+window.__debug.msgs = msgs;
+
+const SYS = "Always respond using valid HTML fragments only. Never use markdown. Use <ul>, <ol>, <li>, <strong>, <em>, <p>, <code>, <pre>, <blockquote>, <h1>-<h3> as appropriate. No <html>, <head>, or <body> tags.";
+
+function render() {
+  log.innerHTML = "";
+  msgs.filter(m => m.role !== "system").forEach(m => {
+    const wrap = document.createElement("div");
+    wrap.className = "flex " + (m.role === "user" ? "msg-user" : "msg-assistant");
+    const bubble = document.createElement("div");
+    bubble.className = "chat-bubble " + (m.role === "user" ? "chat-bubble-primary" : "chat-bubble-secondary");
+    if (m.role === "user") {
+      bubble.textContent = m.content;
+    } else {
+      bubble.innerHTML = m.content;
+    }
+    wrap.appendChild(bubble);
+    log.appendChild(wrap);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+frm.addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = "";
+  msgs.push({ role: "user", content: text });
+  render();
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const payload = [{ role: "system", content: SYS }, ...msgs];
+  const res = await fetch("/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "hermes-agent", messages: payload })
+  });
+  if (!res.ok) { msgs.push({ role: "assistant", content: "<p>Error: " + res.status + "</p>" }); render(); return; }
+  const data = await res.json();
+  const reply = data.choices?.[0]?.message?.content ?? "";
+  msgs.push({ role: "assistant", content: reply });
+  render();
+});
+</script>
+</body>
+</html>
