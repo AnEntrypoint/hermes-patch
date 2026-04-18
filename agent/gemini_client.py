@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
-import queue
 import shlex
-import subprocess
-import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from agent.acp_subprocess import run_acp_subprocess
 
 ACP_MARKER_BASE_URL = "acp://gemini"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -24,23 +21,33 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw) if raw else ["--output-format", "stream-json", "--approval-mode", "yolo"]
 
 
-def _extract_text(line: str) -> str:
-    try:
-        evt = json.loads(line)
-    except Exception:
-        return line.strip()
+def _parse_gemini_event(evt: dict) -> tuple[str, bool]:
+    """Parse one NDJSON event from the Gemini CLI stream-json output.
+
+    Shapes seen in practice::
+
+        {"type":"message","role":"assistant","content":"PONG"}
+        {"type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}]}
+        {"type":"result","response":"PONG"}
+
+    Returns ``(text, finished)``. A ``result`` event terminates the turn.
+    """
     evt_type = evt.get("type")
     if evt_type == "result":
         val = evt.get("response", "")
         if isinstance(val, str) and val.strip():
-            return val.strip()
+            return val.strip(), True
+        return "", True
+    if evt_type == "error":
+        msg = evt.get("error") or evt.get("message") or "unknown error"
+        raise RuntimeError(f"Gemini CLI error: {msg}")
     if evt_type == "message":
         role = str(evt.get("role") or "").lower()
         if role not in ("", "assistant"):
-            return ""
+            return "", False
         content = evt.get("content", "")
         if isinstance(content, str) and content.strip():
-            return content.strip()
+            return content.strip(), False
         if isinstance(content, list):
             parts = [
                 b.get("text", "") for b in content
@@ -48,8 +55,8 @@ def _extract_text(line: str) -> str:
             ]
             joined = "\n".join(p for p in parts if p)
             if joined:
-                return joined
-    return ""
+                return joined, False
+    return "", False
 
 
 class _GemChatCompletions:
@@ -98,7 +105,25 @@ class GeminiClient:
         **_: Any,
     ) -> Any:
         prompt = _messages_to_prompt(messages or [])
-        text = self._run_prompt(prompt, model=model, timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS))
+
+        # Gemini CLI reads the prompt from stdin when --prompt is empty.
+        # Using stdin avoids Windows' 32 KiB CreateProcess command-line cap
+        # and the 8 KiB cmd.exe shim cap.
+        cli_args = list(self._args)
+        if "--prompt" not in cli_args and "-p" not in cli_args:
+            cli_args += ["--prompt", ""]
+        if model and "--model" not in cli_args and "-m" not in cli_args:
+            cli_args += ["--model", model]
+
+        text = run_acp_subprocess(
+            self._command,
+            cli_args,
+            prompt,
+            parse_event=_parse_gemini_event,
+            timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS),
+            cwd=self._cwd,
+            cli_name="gemini",
+        )
         usage = SimpleNamespace(
             prompt_tokens=0,
             completion_tokens=0,
@@ -114,60 +139,6 @@ class GeminiClient:
         )
         choice = SimpleNamespace(message=msg, finish_reason="stop")
         return SimpleNamespace(choices=[choice], usage=usage, model=model or "gemini-acp")
-
-    def _run_prompt(self, prompt: str, *, model: str | None = None, timeout_seconds: float) -> str:
-        cmd = [self._command] + self._args + ["--prompt", prompt]
-        if model:
-            cmd += ["--model", model]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
-                cwd=self._cwd,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start gemini command '{self._command}'. "
-                "Install Gemini CLI or set GEMINI_ACP_COMMAND."
-            ) from exc
-
-        inbox: queue.Queue[str] = queue.Queue()
-
-        def _reader() -> None:
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    inbox.put(line)
-
-        threading.Thread(target=_reader, daemon=True).start()
-
-        parts: list[str] = []
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if proc.poll() is not None and inbox.empty():
-                break
-            try:
-                line = inbox.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            text = _extract_text(line)
-            if text:
-                parts.append(text)
-
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-        if not parts:
-            stderr_out = (proc.stderr.read() or "").strip()
-            raise RuntimeError(f"gemini returned no content. stderr: {stderr_out[:500]}")
-        return "\n".join(parts)
 
 
 def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:

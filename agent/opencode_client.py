@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import json
 import os
-import queue
 import shlex
-import subprocess
-import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from agent.acp_subprocess import (
+    ensure_hermes_llm_agent,
+    parse_opencode_style,
+    run_acp_subprocess,
+)
 
 ACP_MARKER_BASE_URL = "acp://opencode"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -24,27 +25,8 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw) if raw else []
 
 
-def _extract_text(line: str) -> str:
-    try:
-        evt = json.loads(line)
-    except Exception:
-        return line.strip()
-    for key in ("content", "text", "output", "message", "result"):
-        val = evt.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, list):
-            parts = [
-                b.get("text", "") for b in val
-                if isinstance(b, dict) and b.get("type") == "text"
-            ]
-            joined = "\n".join(p for p in parts if p)
-            if joined:
-                return joined
-    for val in evt.values():
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return ""
+def _opencode_config_dir() -> Path:
+    return Path(os.path.expanduser("~/.config/opencode"))
 
 
 class _OCChatCompletions:
@@ -92,8 +74,27 @@ class OpenCodeClient:
         timeout: float | None = None,
         **_: Any,
     ) -> Any:
+        ensure_hermes_llm_agent(_opencode_config_dir())
         prompt = _messages_to_prompt(messages or [])
-        text = self._run_prompt(prompt, model=model, timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS))
+
+        cli_args = list(self._args) + ["run", "--format", "json"]
+        # Use the zero-tool hermes-llm agent by default so opencode returns
+        # a single completion and exits on step-finish instead of looping
+        # through its own tool-calling turns.
+        if "--agent" not in cli_args:
+            cli_args += ["--agent", "hermes-llm"]
+        if model:
+            cli_args += ["--model", model]
+
+        text = run_acp_subprocess(
+            self._command,
+            cli_args,
+            prompt,
+            parse_event=parse_opencode_style,
+            timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS),
+            cwd=self._cwd,
+            cli_name="opencode",
+        )
         usage = SimpleNamespace(
             prompt_tokens=0,
             completion_tokens=0,
@@ -109,61 +110,6 @@ class OpenCodeClient:
         )
         choice = SimpleNamespace(message=msg, finish_reason="stop")
         return SimpleNamespace(choices=[choice], usage=usage, model=model or "opencode-acp")
-
-    def _run_prompt(self, prompt: str, *, model: str | None = None, timeout_seconds: float) -> str:
-        cmd = [self._command] + self._args + ["run", "--format", "json"]
-        if model:
-            cmd += ["--model", model]
-        cmd.append(prompt)
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
-                cwd=self._cwd,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start opencode command '{self._command}'. "
-                "Install opencode or set OPENCODE_ACP_COMMAND."
-            ) from exc
-
-        inbox: queue.Queue[str] = queue.Queue()
-
-        def _reader() -> None:
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    inbox.put(line)
-
-        threading.Thread(target=_reader, daemon=True).start()
-
-        parts: list[str] = []
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if proc.poll() is not None and inbox.empty():
-                break
-            try:
-                line = inbox.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            text = _extract_text(line)
-            if text:
-                parts.append(text)
-
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-        if not parts:
-            stderr_out = (proc.stderr.read() or "").strip()
-            raise RuntimeError(f"opencode returned no content. stderr: {stderr_out[:500]}")
-        return "\n".join(parts)
 
 
 def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:

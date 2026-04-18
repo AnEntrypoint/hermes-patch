@@ -772,7 +772,7 @@ class AIAgent:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-                if self.provider == "copilot-acp":
+                if self.provider in ("copilot-acp", "claude-code-acp", "kilocode-acp", "opencode-acp", "gemini-acp", "claude-agent-acp", "llm-acp"):
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
